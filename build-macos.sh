@@ -17,7 +17,7 @@ swiftc \
 # 2. Compile LiveCabinDSP dylib (x86_64 for ETS2 Rosetta / x86_64 process)
 clang -dynamiclib -O2 -Wall -Wextra -arch x86_64 -mmacosx-version-min=10.13 \
   -Wl,-undefined,dynamic_lookup -install_name '@rpath/libETS2CabinDSP.dylib' \
-  -o libETS2CabinDSP.dylib LiveCabinDSP.c
+  -o libETS2CabinDSP.dylib LiveCabinDSP.c upnp.c
 
 # 3. Assemble application bundle
 APP_DIR="ETS2 Cabin Radio.app"

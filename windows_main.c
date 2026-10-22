@@ -26,6 +26,7 @@ enum {
     ID_SLIDER_INTENSITY = 201,
     ID_SLIDER_REAR = 202,
     ID_SLIDER_POSITION = 203,
+    ID_CHK_UPNP = 204,
     ID_BTN_LAUNCH = 301,
     ID_BTN_PLUGIN = 302,
     ID_BTN_OPEN_LOG = 303,
@@ -49,6 +50,7 @@ static int g_preset_index = 0;
 static float g_intensity = 0.72f;
 static float g_rear = 0.75f;
 static float g_position = 0.12f;
+static bool g_upnp_enabled = false;
 static char g_game_exe_path[MAX_PATH] = "";
 
 static HWND g_hwnd_preset_btns[4];
@@ -60,6 +62,7 @@ static HWND g_hwnd_rear_slider = NULL;
 static HWND g_hwnd_position_val = NULL;
 static HWND g_hwnd_position_slider = NULL;
 static HWND g_hwnd_status = NULL;
+static HWND g_hwnd_chk_upnp = NULL;
 static HWND g_hwnd_btn_plugin = NULL;
 
 static HFONT g_font_title = NULL;
@@ -94,8 +97,8 @@ static void write_live_settings_file(void) {
 
     FILE *f = fopen(file_path, "wb");
     if (!f) return;
-    fprintf(f, "preset=%s\nintensity=%.4f\nrear=%.4f\nposition=%.4f\n",
-            kPresets[g_preset_index].key, g_intensity, g_rear, g_position);
+    fprintf(f, "preset=%s\nintensity=%.4f\nrear=%.4f\nposition=%.4f\nupnp=%d\n",
+            kPresets[g_preset_index].key, g_intensity, g_rear, g_position, g_upnp_enabled ? 1 : 0);
     fclose(f);
 }
 
@@ -111,6 +114,8 @@ static void save_registry_settings(void) {
         RegSetValueExA(key, "IntensityPermille", 0, REG_DWORD, (const BYTE *)&int_pct, sizeof(DWORD));
         RegSetValueExA(key, "RearPermille", 0, REG_DWORD, (const BYTE *)&rear_pct, sizeof(DWORD));
         RegSetValueExA(key, "PositionPermille", 0, REG_DWORD, (const BYTE *)&pos_raw, sizeof(DWORD));
+        DWORD upnp_dw = g_upnp_enabled ? 1 : 0;
+        RegSetValueExA(key, "UpnpEnabled", 0, REG_DWORD, (const BYTE *)&upnp_dw, sizeof(DWORD));
         if (g_game_exe_path[0]) {
             RegSetValueExA(key, "GameExePath", 0, REG_SZ,
                            (const BYTE *)g_game_exe_path, (DWORD)strlen(g_game_exe_path) + 1);
@@ -148,6 +153,12 @@ static void load_registry_settings(void) {
         if (RegQueryValueExA(key, "PositionPermille", NULL, NULL, (BYTE *)&val, &sz) == ERROR_SUCCESS) {
             float v = ((float)val / 1000.0f) - 1.0f;
             if (v >= -1.0f && v <= 1.0f) g_position = v;
+        }
+        sz = sizeof(DWORD);
+        if (RegQueryValueExA(key, "UpnpEnabled", NULL, NULL, (BYTE *)&val, &sz) == ERROR_SUCCESS) {
+            g_upnp_enabled = (val != 0);
+        } else {
+            g_upnp_enabled = false;
         }
         sz = sizeof(g_game_exe_path);
         RegQueryValueExA(key, "GameExePath", NULL, NULL, (BYTE *)g_game_exe_path, &sz);
@@ -617,42 +628,55 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
         SendMessageA(g_hwnd_position_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
         SendMessageA(g_hwnd_position_slider, TBM_SETPOS, TRUE, (LPARAM)(int)((g_position + 1.0f) * 100.0f + 0.5f));
 
+        /* Audio Streaming Card */
+        HWND grp_stream = CreateWindowExA(0, "BUTTON", "Audio Streaming",
+                                          WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                                          24, 348, 636, 60, hwnd, NULL, inst, NULL);
+        SendMessageA(grp_stream, WM_SETFONT, (WPARAM)g_font_section, TRUE);
+
+        g_hwnd_chk_upnp = CreateWindowExA(
+            0, "BUTTON", "Enable UPnP / DLNA Renderer (Stream audio from local network music players).",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+            42, 374, 596, 22, hwnd, (HMENU)ID_CHK_UPNP, inst, NULL);
+        SendMessageA(g_hwnd_chk_upnp, WM_SETFONT, (WPARAM)g_font_body, TRUE);
+        SendMessageA(g_hwnd_chk_upnp, BM_SETCHECK, g_upnp_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+
         /* Launch Card */
-        HWND grp_live = CreateWindowExA(0, "BUTTON", "Launch & Live Injection",
+        HWND grp_live = CreateWindowExA(0, "BUTTON", "Launch / Live Injection",
                                         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                        24, 348, 636, 156, hwnd, NULL, inst, NULL);
+                                        24, 420, 636, 150, hwnd, NULL, inst, NULL);
         SendMessageA(grp_live, WM_SETFONT, (WPARAM)g_font_section, TRUE);
 
         HWND live_desc = CreateWindowExA(
             0, "STATIC",
-            "Simulates Front Left/Right dash & door speakers, Rear Left/Right sleeper speakers, under-seat sub, and cabin glass reflections—reacting in 360 degrees to camera rotation and windows.",
-            WS_CHILD | WS_VISIBLE, 42, 374, 596, 38, hwnd, NULL, inst, NULL);
+            "Simulates Front Left/Right dash and door speakers, Rear Left/Right sleeper speakers, under-seat sub, and cabin glass reflections - reacting in 360 degrees to camera rotation and windows.",
+            WS_CHILD | WS_VISIBLE, 42, 446, 596, 38, hwnd, NULL, inst, NULL);
         SendMessageA(live_desc, WM_SETFONT, (WPARAM)g_font_body, TRUE);
 
         g_hwnd_status = CreateWindowExA(
             0, "STATIC",
-            "Ready. Adjust presets or sliders at any time—even while ETS2 is running.",
-            WS_CHILD | WS_VISIBLE, 42, 416, 596, 22, hwnd, NULL, inst, NULL);
+            "Ready. Adjust presets or sliders at any time - even while ETS2 is running.",
+            WS_CHILD | WS_VISIBLE, 42, 488, 596, 20, hwnd, NULL, inst, NULL);
         SendMessageA(g_hwnd_status, WM_SETFONT, (WPARAM)g_font_caption, TRUE);
 
         HWND btn_launch = CreateWindowExA(0, "BUTTON", "Launch / Attach Live DSP",
                                           WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                                          42, 446, 195, 38, hwnd, (HMENU)ID_BTN_LAUNCH, inst, NULL);
+                                          42, 516, 195, 38, hwnd, (HMENU)ID_BTN_LAUNCH, inst, NULL);
         SendMessageA(btn_launch, WM_SETFONT, (WPARAM)g_font_section, TRUE);
 
         g_hwnd_btn_plugin = CreateWindowExA(0, "BUTTON", "Install Steam Auto-Plugin",
                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                            247, 446, 175, 38, hwnd, (HMENU)ID_BTN_PLUGIN, inst, NULL);
+                                            247, 516, 175, 38, hwnd, (HMENU)ID_BTN_PLUGIN, inst, NULL);
         SendMessageA(g_hwnd_btn_plugin, WM_SETFONT, (WPARAM)g_font_body, TRUE);
 
         HWND btn_log = CreateWindowExA(0, "BUTTON", "Open DSP Log",
                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                       432, 446, 100, 38, hwnd, (HMENU)ID_BTN_OPEN_LOG, inst, NULL);
+                                       432, 516, 100, 38, hwnd, (HMENU)ID_BTN_OPEN_LOG, inst, NULL);
         SendMessageA(btn_log, WM_SETFONT, (WPARAM)g_font_body, TRUE);
 
         HWND btn_music = CreateWindowExA(0, "BUTTON", "Music Folder",
                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         540, 446, 100, 38, hwnd, (HMENU)ID_BTN_OPEN_MUSIC, inst, NULL);
+                                         540, 516, 100, 38, hwnd, (HMENU)ID_BTN_OPEN_MUSIC, inst, NULL);
         SendMessageA(btn_music, WM_SETFONT, (WPARAM)g_font_body, TRUE);
 
         update_labels();
@@ -690,6 +714,15 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
             return 0;
         }
         switch (id) {
+        case ID_CHK_UPNP:
+            g_upnp_enabled = (SendMessageA(g_hwnd_chk_upnp, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            save_registry_settings();
+            if (g_upnp_enabled) {
+                SetWindowTextA(g_hwnd_status, "UPnP Renderer enabled: Cast audio from your phone to 'ETS2 Cabin Radio'.");
+            } else {
+                SetWindowTextA(g_hwnd_status, "UPnP Renderer disabled: Game multimedia radio restored.");
+            }
+            return 0;
         case ID_BTN_LAUNCH:
             launch_or_attach_ets2(hwnd);
             return 0;
@@ -747,7 +780,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev, LPSTR cmdline, int show) 
     RegisterClassExA(&wc);
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT rc = { 0, 0, 684, 526 };
+    RECT rc = { 0, 0, 684, 608 };
     AdjustWindowRect(&rc, style, FALSE);
 
     HWND hwnd = CreateWindowExA(

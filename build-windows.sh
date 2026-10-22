@@ -26,7 +26,7 @@ fi
 
 # 1. Compile 64-bit live DSP DLL
 "$ZIG" cc -target x86_64-windows-gnu -shared -O2 -Wall -Wextra \
-  -o ETS2CabinDSP.dll LiveCabinDSP.c
+  -o ETS2CabinDSP.dll LiveCabinDSP.c upnp.c -lws2_32
 
 # 2. Compile 64-bit Windows GUI launcher
 "$ZIG" cc -target x86_64-windows-gnu -O2 -Wall -Wextra -Wl,--subsystem,windows \

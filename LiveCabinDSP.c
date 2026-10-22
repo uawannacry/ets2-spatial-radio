@@ -22,6 +22,17 @@
 #include <string.h>
 #include <time.h>
 
+
+void cabin_log(const char *format, ...);
+
+/*UPnP / DLNA MediaRenderer engine (implemented in upnp.c) */
+bool upnp_init(void);
+void upnp_shutdown(void);
+void upnp_set_enabled(bool enabled);
+bool upnp_is_active(void);
+bool upnp_is_playing(void);
+bool upnp_get_sample(float *out_left, float *out_right);
+
 #ifndef PATH_MAX
 #define PATH_MAX 1024
 #endif
@@ -201,6 +212,10 @@ typedef struct {
     float sub_lp2;
     float refl_lp_L;
     float refl_lp_R;
+    float eq_lp1_L;
+    float eq_lp1_R;
+    float eq_lp2_L;
+    float eq_lp2_R;
 
     /* Smoothed per-sample parameters */
     SpatialTargets current;
@@ -229,6 +244,10 @@ static FMOD_DSP *g_eq_dsp = NULL;
 static FMOD_DSP *g_spatial_dsp = NULL;
 static FMOD_DSP *g_compressor_dsp = NULL;
 static CabinSettings g_settings;
+static float g_dyn_low_gain = 0.0f;
+static float g_dyn_mid_gain = 0.0f;
+static float g_dyn_high_gain = 0.0f;
+static bool g_settings_loaded_once = false;
 static SpatialTargets g_targets;
 static CabinDSPState g_dsp_state;
 static float g_last_rot = 999.0f;
@@ -238,6 +257,8 @@ static float g_last_wnd_r = 999.0f;
 static unsigned int g_retry_counter = 0;
 static CabinAPI g_api;
 static FILE *g_log = NULL;
+static bool g_upnp_target_enabled = false;
+static bool g_upnp_active = false;
 
 #ifdef __APPLE__
 extern FMOD_RESULT FMOD_Studio_System_Update(FMOD_STUDIO_SYSTEM *system);
@@ -290,7 +311,7 @@ static void open_log(void) {
     if (!g_log) g_log = stderr;
 }
 
-static void cabin_log(const char *format, ...) {
+void cabin_log(const char *format, ...) {
     open_log();
     time_t now = time(NULL);
     struct tm local;
@@ -461,6 +482,8 @@ static CabinSettings read_settings(void) {
                 rear_level = strtof(line + 5, NULL);
             } else if (strncmp(line, "position=", 9) == 0) {
                 position = strtof(line + 9, NULL);
+            } else if (strncmp(line, "upnp=", 5) == 0) {
+                g_upnp_target_enabled = (atoi(line + 5) != 0);
             }
         }
         fclose(file);
@@ -482,6 +505,19 @@ static inline float read_delay_frac(const float *buf, unsigned int write_pos, fl
     return buf[idx0] + frac * (buf[idx1] - buf[idx0]);
 }
 
+static FMOD_RESULT cabin_should_i_process(
+    void *dsp_state,
+    int inputsidle,
+    unsigned int length,
+    int inmask,
+    int inchannels,
+    int speakermode
+) {
+    (void)dsp_state; (void)inputsidle; (void)length;
+    (void)inmask; (void)inchannels; (void)speakermode;
+    return FMOD_OK; /* Process continuously even if game radio bus is idle */
+}
+
 /*
  * Real-time 48 kHz 3D Multi-Speaker Cabin DSP callback.
  * Simulates Front L/R (dash + door), Rear L/R (sleeper/B-pillar), Under-seat Sub,
@@ -497,9 +533,23 @@ static FMOD_RESULT cabin_spatial_dsp_read(
 ) {
     (void)dsp_state;
     if (outchannels) *outchannels = inchannels;
-    if (!inbuffer || !outbuffer || inchannels < 1) return FMOD_OK;
+    if (!outbuffer || inchannels < 1) return FMOD_OK;
 
-    if (inchannels == 1) {
+    bool upnp_active = g_upnp_active && upnp_is_playing();
+
+    static bool s_diag_logged = false;
+    if (!s_diag_logged) {
+        s_diag_logged = true;
+        cabin_log("DSP READ ACTIVE: inchannels=%d, upnp_active=%d, inbuf=%p, len=%u",
+                  inchannels, upnp_active, inbuffer, length);
+    }
+
+    if (!inbuffer && !upnp_active) {
+        memset(outbuffer, 0, length * inchannels * sizeof(float));
+        return FMOD_OK;
+    }
+
+    if (inchannels == 1 && !upnp_active) {
         memcpy(outbuffer, inbuffer, length * sizeof(float));
         return FMOD_OK;
     }
@@ -524,9 +574,47 @@ static FMOD_RESULT cabin_spatial_dsp_read(
     const float smooth = 0.0025f;
     const float cross = g_settings.crossfeed;
 
+    /* Equalizer gain multipliers from dynamic live state (220 Hz / 5000 Hz crossovers at 48 kHz) */
+    float eq_g_low  = powf(10.0f, g_dyn_low_gain / 20.0f);
+    float eq_g_mid  = powf(10.0f, g_dyn_mid_gain / 20.0f);
+    float eq_g_high = powf(10.0f, g_dyn_high_gain / 20.0f);
+    const float eq_alpha_low = 0.0284f;  /* ~220 Hz crossover at 48 kHz */
+    const float eq_alpha_high = 0.4803f; /* ~5000 Hz crossover at 48 kHz */
+
+    static bool s_flowing_logged = false;
+    if (upnp_active && !s_flowing_logged) {
+        s_flowing_logged = true;
+        cabin_log("UPnP audio flowing into 4.1 cabin DSP graph (inchannels=%d).", inchannels);
+    } else if (!upnp_active && s_flowing_logged) {
+        s_flowing_logged = false;
+    }
+
     for (unsigned int i = 0; i < length; i++) {
-        float in_L = inbuffer[i * inchannels + 0];
-        float in_R = inbuffer[i * inchannels + 1];
+        float in_L = 0.0f;
+        float in_R = 0.0f;
+
+        if (upnp_active) {
+            upnp_get_sample(&in_L, &in_R);
+
+            /* Apply 3-Band Cabin EQ to UPnP audio (matching g_eq_dsp) */
+            st->eq_lp1_L += eq_alpha_low * (in_L - st->eq_lp1_L);
+            st->eq_lp1_R += eq_alpha_low * (in_R - st->eq_lp1_R);
+            st->eq_lp2_L += eq_alpha_high * (in_L - st->eq_lp2_L);
+            st->eq_lp2_R += eq_alpha_high * (in_R - st->eq_lp2_R);
+
+            float low_L = st->eq_lp1_L;
+            float low_R = st->eq_lp1_R;
+            float mid_L = st->eq_lp2_L - st->eq_lp1_L;
+            float mid_R = st->eq_lp2_R - st->eq_lp1_R;
+            float high_L = in_L - st->eq_lp2_L;
+            float high_R = in_R - st->eq_lp2_R;
+
+            in_L = low_L * eq_g_low + mid_L * eq_g_mid + high_L * eq_g_high;
+            in_R = low_R * eq_g_low + mid_R * eq_g_mid + high_R * eq_g_high;
+        } else if (inbuffer) {
+            in_L = inbuffer[i * inchannels + 0];
+            in_R = (inchannels > 1) ? inbuffer[i * inchannels + 1] : in_L;
+        }
 
         /* Smoothly interpolate spatial targets sample-by-sample (click-free head turns). */
         for (int s = 0; s < 4; s++) {
@@ -611,10 +699,14 @@ static FMOD_RESULT cabin_spatial_dsp_read(
         float out_L = dry * in_L + wet * ear_L;
         float out_R = dry * in_R + wet * ear_R;
 
-        outbuffer[i * inchannels + 0] = out_L;
-        outbuffer[i * inchannels + 1] = out_R;
-        for (int c = 2; c < inchannels; c++) {
-            outbuffer[i * inchannels + c] = inbuffer[i * inchannels + c];
+        if (inchannels == 1) {
+            outbuffer[i] = 0.5f * (out_L + out_R);
+        } else {
+            outbuffer[i * inchannels + 0] = out_L;
+            outbuffer[i * inchannels + 1] = out_R;
+            for (int c = 2; c < inchannels; c++) {
+                outbuffer[i * inchannels + c] = inbuffer ? inbuffer[i * inchannels + c] : 0.0f;
+            }
         }
 
         st->write_pos = (wp + 1u) & CABIN_DELAY_MASK;
@@ -642,6 +734,7 @@ static FMOD_DSP *create_spatial_cabin_dsp(FMOD_SYSTEM *core) {
     desc.numinputbuffers = 1;
     desc.numoutputbuffers = 1;
     desc.read = cabin_spatial_dsp_read;
+    desc.shouldiprocess = cabin_should_i_process;
 
     FMOD_DSP *dsp = NULL;
     FMOD_RESULT result = g_api.create_dsp(core, &desc, &dsp);
@@ -664,6 +757,10 @@ static bool attach_effect(FMOD_CHANNELGROUP *group, FMOD_DSP *effect, const char
 }
 
 static void configure_eq(FMOD_DSP *effect, CabinSettings s) {
+    g_dyn_low_gain = s.low_gain;
+    g_dyn_mid_gain = s.mid_gain;
+    g_dyn_high_gain = s.high_gain;
+    if (!effect) return;
     g_api.set_float(effect, EQ_LOWGAIN, s.low_gain);
     g_api.set_float(effect, EQ_MIDGAIN, s.mid_gain);
     g_api.set_float(effect, EQ_HIGHGAIN, s.high_gain);
@@ -824,7 +921,12 @@ static void check_live_reload(void) {
     g_last_cfg_mtime = token;
 
     g_settings = read_settings();
-    if (g_eq_dsp) configure_eq(g_eq_dsp, g_settings);
+    if (g_upnp_target_enabled != g_upnp_active) {
+        g_upnp_active = g_upnp_target_enabled;
+        upnp_set_enabled(g_upnp_active);
+        cabin_log("UPnP Cabin Renderer %s via live settings.", g_upnp_active ? "enabled" : "disabled");
+    }
+    configure_eq(g_eq_dsp, g_settings);
     if (g_compressor_dsp) configure_compressor(g_compressor_dsp, g_settings);
     g_last_rot = 999.0f;
 }
@@ -856,14 +958,15 @@ static void update_spatial_state(FMOD_STUDIO_SYSTEM *studio) {
 
     compute_spatial_targets(rot_rad, cabin_out, wnd_left, wnd_right);
 
+    float open_air = clamp_float(cabin_out + 0.45f * window_open, 0.0f, 1.0f);
+    g_dyn_low_gain  = g_settings.low_gain * (1.0f - 0.45f * open_air) - (2.2f * cabin_out);
+    g_dyn_mid_gain  = g_settings.mid_gain - (1.5f * cabin_out);
+    g_dyn_high_gain = g_settings.high_gain - (3.2f * cabin_out);
+
     if (g_eq_dsp) {
-        float open_air = clamp_float(cabin_out + 0.45f * window_open, 0.0f, 1.0f);
-        float low_gain = g_settings.low_gain * (1.0f - 0.45f * open_air) - (2.2f * cabin_out);
-        float mid_gain = g_settings.mid_gain - (1.5f * cabin_out);
-        float high_gain = g_settings.high_gain - (3.2f * cabin_out);
-        g_api.set_float(g_eq_dsp, EQ_LOWGAIN, low_gain);
-        g_api.set_float(g_eq_dsp, EQ_MIDGAIN, mid_gain);
-        g_api.set_float(g_eq_dsp, EQ_HIGHGAIN, high_gain);
+        g_api.set_float(g_eq_dsp, EQ_LOWGAIN, g_dyn_low_gain);
+        g_api.set_float(g_eq_dsp, EQ_MIDGAIN, g_dyn_mid_gain);
+        g_api.set_float(g_eq_dsp, EQ_HIGHGAIN, g_dyn_high_gain);
     }
 
     if (!g_turn_logged && fabsf(rot_rad) > 0.25f) {
@@ -927,6 +1030,11 @@ static bool try_install(FMOD_STUDIO_SYSTEM *studio) {
     }
 
     g_settings = read_settings();
+    if (g_upnp_target_enabled != g_upnp_active) {
+        g_upnp_active = g_upnp_target_enabled;
+        upnp_set_enabled(g_upnp_active);
+        cabin_log("UPnP Cabin Renderer %s via live settings.", g_upnp_active ? "enabled" : "disabled");
+    }
     compute_spatial_targets(0.0f, 0.0f, 0.0f, 0.0f);
     int attached = 0;
 
@@ -975,12 +1083,29 @@ static void cabin_after_update(FMOD_STUDIO_SYSTEM *studio, const char *hook_name
         g_hook_logged = true;
         cabin_log("FMOD update hook active: %s", hook_name);
     }
+
+    if (!g_settings_loaded_once) {
+        g_settings_loaded_once = true;
+        char path[PATH_MAX];
+        live_settings_path(path, sizeof(path));
+        g_last_cfg_mtime = file_mtime_token(path);
+        g_settings = read_settings();
+        configure_eq(NULL, g_settings);
+        if (g_upnp_target_enabled != g_upnp_active) {
+            g_upnp_active = g_upnp_target_enabled;
+            upnp_set_enabled(g_upnp_active);
+            cabin_log("UPnP Cabin Renderer %s on startup.", g_upnp_active ? "enabled" : "disabled");
+        }
+    }
+
     if (g_dry_run || g_disabled || !studio) return;
 
     if (g_installed) {
         update_spatial_state(studio);
         return;
     }
+
+    check_live_reload();
 
     unsigned int tick = g_retry_counter++;
     if (tick < 3) return;
@@ -1026,10 +1151,16 @@ static struct {
 
 __attribute__((constructor))
 static void cabin_loaded(void) {
+    upnp_init();
     const char *dry_run = getenv("ETS2_CABIN_DRY_RUN");
     g_dry_run = dry_run && strcmp(dry_run, "1") == 0;
     cabin_log("ETS2 Cabin Radio live DSP loaded (pid %d).", getpid());
     if (g_dry_run) cabin_log("Dry-run mode enabled: no DSP will be attached.");
+}
+
+__attribute__((destructor))
+static void cabin_unloaded(void) {
+    upnp_shutdown();
 }
 
 #elif defined(_WIN32)
@@ -1113,6 +1244,7 @@ static int patch_module_iat(HMODULE module) {
 
 static unsigned __stdcall cabin_hook_worker(void *unused) {
     (void)unused;
+    upnp_init();
     for (int attempt = 0; attempt < 300; attempt++) {
         HMODULE fmod_studio = GetModuleHandleA("fmodstudio.dll");
         if (!fmod_studio) fmod_studio = GetModuleHandleA("fmodstudioL.dll");
@@ -1156,14 +1288,18 @@ __declspec(dllexport) int __cdecl scs_telemetry_init(int version, const void *pa
 }
 
 __declspec(dllexport) void __cdecl scs_telemetry_shutdown(void) {
+    upnp_shutdown();
     cabin_log("SCS plugin shutdown notification received.");
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
-    (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
         start_windows_hook_once("DllMain");
+    } else if (reason == DLL_PROCESS_DETACH) {
+        if (reserved == NULL) {
+            upnp_shutdown();
+        }
     }
     return TRUE;
 }
